@@ -1,10 +1,6 @@
 services:
   - type: web
     name: radar-leiloes
-    runtime: docker
+    env: docker
     plan: free
-    envVars:
-      - key: RADAR_RUN_TOKEN
-        generateValue: true
-      - key: DATABASE_URL
-        value: sqlite:///./radar.db
+    autoDeploy: true
