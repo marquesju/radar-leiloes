@@ -1,4 +1,6 @@
-fastapi>=0.115,<1
-uvicorn[standard]>=0.30,<1
-sqlalchemy>=2,<3
-psycopg2-binary>=2.9,<3
+fastapi
+uvicorn
+sqlalchemy
+requests
+beautifulsoup4
+psycopg2-binary
