@@ -16,7 +16,8 @@ if DATABASE_URL.startswith("postgres://"):
 elif DATABASE_URL.startswith("postgresql://"):
     DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg2://", 1)
 
-engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+connect_args = {"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}
+engine = create_engine(DATABASE_URL, pool_pre_ping=True, connect_args=connect_args)
 Base = declarative_base()
 SessionLocal = sessionmaker(bind=engine)
 
@@ -41,8 +42,12 @@ Base.metadata.create_all(engine)
 app = FastAPI(title="Radar de Leilões")
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36 Chrome/130 Safari/537.36"
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Safari/537.36",
+    "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Referer": "https://www.google.com/",
 }
+
 SOURCES = {
     "Leilão Imóvel": {
         "Guarapari": "https://www.leilaoimovel.com.br/leilao-de-imovel/guarapari-es",
@@ -64,13 +69,12 @@ def now_local():
 
 
 def parse_dt(s):
-    try:
-        return datetime.strptime(s, "%d/%m/%Y %H:%M").replace(tzinfo=SP)
-    except Exception:
+    for fmt in ("%d/%m/%Y %H:%M", "%d/%m/%Y"):
         try:
-            return datetime.strptime(s, "%d/%m/%Y").replace(tzinfo=SP)
+            return datetime.strptime(s, fmt).replace(tzinfo=SP)
         except Exception:
-            return None
+            pass
+    return None
 
 
 def future_dates(text):
@@ -97,9 +101,8 @@ def clean(s):
 
 
 def extract_address(text):
-    # Keep a useful address fragment when the source exposes it.
     m = re.search(r"\b(Rua|R\.|Avenida|Av\.|Alameda|Praça|Rodovia|Estrada|Travessa|Ladeira)\b[^\n]{5,300}", text or "", re.I)
-    return clean(m.group(0)) if m else ""
+    return clean(re.split(r"\b(?:1ª|2ª|3ª)\s+Praça\s*:", m.group(0), maxsplit=1, flags=re.I)[0]) if m else ""
 
 
 def modality_from(text):
@@ -108,6 +111,8 @@ def modality_from(text):
         return "Extrajudicial"
     if "judicial" in t:
         return "Judicial"
+    if "leilão sfi" in t:
+        return "Leilão SFI"
     if "caixa" in t:
         return "Caixa"
     if "licitação" in t:
@@ -117,118 +122,146 @@ def modality_from(text):
     return ""
 
 
-def relevant_block(anchor):
-    # The previous version only inspected anchor.parent. On Leilão Imóvel the
-    # property card is several levels above the link, so walk ancestors and
-    # choose the smallest useful card containing both price and auction date.
-    best = ""
-    node = anchor
-    for _ in range(8):
-        node = getattr(node, "parent", None)
-        if not node:
-            break
-        text = clean(node.get_text(" ", strip=True))
-        if len(text) > 1800:
-            continue
-        if "R$" in text and ("Data de encerramento" in text or DATE_RE.search(text)):
-            best = text
-            if len(text) >= 180:
-                return text
-    return best or clean(anchor.get_text(" ", strip=True))
+def fetch_page(url, source):
+    """Fetch normally. Leilão Imóvel uses Cloudflare and may block Render IPs.
+    In that case use Jina's public reader as a read-only fallback. No login or
+    CAPTCHA bypass is attempted.
+    """
+    errors = []
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=30)
+        if r.ok and len(r.text) > 500:
+            return r.text, "html", errors
+        errors.append(f"direct HTTP {r.status_code}")
+    except Exception as e:
+        errors.append(f"direct {type(e).__name__}: {e}")
+
+    if source == "Leilão Imóvel":
+        proxy = "https://r.jina.ai/http://" + url.split("//", 1)[1]
+        try:
+            r = requests.get(proxy, headers={"User-Agent": HEADERS["User-Agent"]}, timeout=45)
+            if r.ok and len(r.text) > 500:
+                return r.text, "text", errors
+            errors.append(f"reader HTTP {r.status_code}")
+        except Exception as e:
+            errors.append(f"reader {type(e).__name__}: {e}")
+    raise RuntimeError("; ".join(errors))
 
 
 def is_property_title(text):
     t = (text or "").lower()
-    return any(k in t for k in ["apartamento em leilão", "casa em leilão", "terreno", "loja em leilão", "sala comercial", "imóvel comercial", "vaga de garagem", "lote em leilão", "fazenda em leilão", "imóveis em leilão"])
+    return any(k in t for k in [
+        "apartamento em leilão", "apartamentos em leilão", "casa em leilão",
+        "terreno em leilão", "terreno urbano em leilão", "lote de terreno em leilão",
+        "lote em leilão", "loja em leilão", "sala comercial em leilão",
+        "imóvel comercial em leilão", "vaga de garagem em leilão", "área de terras em leilão"
+    ])
 
 
-def scrape_source(source, city, url):
-    r = requests.get(url, headers=HEADERS, timeout=35)
-    r.raise_for_status()
-    soup = BeautifulSoup(r.text, "html.parser")
-    out, seen = [], set()
+def extract_leilao_imovel_text(text, city, url):
+    """Parse the server/reader text of the Leilão Imóvel city page.
+    Each property is represented by a block beginning with 'Data de encerramento'.
+    """
+    out = []
+    # Normalize reader markdown/HTML into one searchable text stream.
+    text = re.sub(r"<[^>]+>", " ", text or "")
+    text = text.replace("\u00a0", " ")
+    text = re.sub(r"\s+", " ", text)
 
-    # First pass: anchors. Walk up the DOM so Leilão Imóvel cards are captured.
-    for a in soup.find_all("a", href=True):
-        title = clean(a.get_text(" ", strip=True))
-        block = relevant_block(a)
-        if not block or "R$" not in block:
-            continue
-        if not ("leilão" in block.lower() or "leilao" in block.lower() or "Data de encerramento" in block):
-            continue
+    marker = re.compile(r"Data de encerramento:\s*\d{2}/\d{2}/\d{4}(?:\s+\d{2}:\d{2})?", re.I)
+    starts = [m.start() for m in marker.finditer(text)]
+    for i, start in enumerate(starts):
+        block = text[start:(starts[i + 1] if i + 1 < len(starts) else len(text))]
+        if len(block) > 5000:
+            block = block[:5000]
         dates = future_dates(block)
-        # Explicitly expired records are discarded. No future date = inactive.
         if not dates:
+            continue
+        # Property title is usually the first occurrence after the price(s).
+        mtitle = re.search(r"((?:Apartamento|Apartamentos|Casa|Terreno|Terreno Urbano|Lote De Terreno|Lote|Loja|Sala Comercial|Imóvel Comercial|Vaga de Garagem|Área De Terras) em Leilão em [^0-9]{2,120}?\s*-\s*\d{5,10}[^\n]{0,350})", block, re.I)
+        if not mtitle:
+            mtitle = re.search(r"((?:Apartamento|Apartamentos|Casa|Terreno|Terreno Urbano|Lote De Terreno|Lote|Loja|Sala Comercial|Imóvel Comercial|Vaga de Garagem|Área De Terras) em Leilão[^\n]{0,500})", block, re.I)
+        title = clean(mtitle.group(1)) if mtitle else ""
+        if not title:
             continue
         prices = money_values(block)
         if not prices:
             continue
-
-        # On Leilão Imóvel the first non-struck price is normally the current bid.
+        # Current price is the first non-struck/current price shown by the source.
         price = prices[0]
-        if source == "Leilão Imóvel" and len(prices) > 1:
-            # If a current/future 2nd/3rd auction is present, prefer the price
-            # closest to the future auction text rather than an old crossed-out price.
-            price = prices[-1] if len(prices) <= 2 else prices[0]
+        # If the first price is followed by an appraisal, keep first as minimum.
+        appraisal = prices[1] if len(prices) > 1 else None
+        # Use the URL only at city-page level if the detail URL cannot be recovered.
+        # The numeric Leilão Imóvel code is useful for a stable detail URL.
+        code_m = re.search(r"-\s*(\d{5,10})\b", title)
+        detail = url
+        if code_m:
+            detail = url
+        out.append({
+            "city": city,
+            "title": title[:500],
+            "address": extract_address(block),
+            "price": price,
+            "appraisal": appraisal,
+            "auction_date": dates[0][1],
+            "modality": modality_from(block),
+            "source": "Leilão Imóvel",
+            "source_url": detail,
+        })
+    return out
 
-        href = urljoin(url, a["href"])
-        if not title or not is_property_title(title):
-            # Use a nearby heading when the link itself is only an image/button.
-            parent = a.parent
-            headings = parent.find_all(["h1", "h2", "h3", "h4"], limit=3) if parent else []
-            title = clean(headings[0].get_text(" ", strip=True)) if headings else title
-        if not title:
+
+def scrape_source(source, city, url):
+    raw, kind, fetch_errors = fetch_page(url, source)
+    if source == "Leilão Imóvel" and kind == "text":
+        return extract_leilao_imovel_text(raw, city, url)
+
+    soup = BeautifulSoup(raw, "html.parser") if kind == "html" else None
+    out, seen = [], set()
+    if not soup:
+        return []
+
+    # Generic fallback parser for LeilôAI and other HTML sources.
+    for node in soup.find_all(["a", "article", "div"]):
+        text = clean(node.get_text(" ", strip=True))
+        if len(text) < 60 or "R$" not in text:
             continue
-
-        key = (city, source, href or title, dates[0][1])
+        dates = future_dates(text)
+        if not dates:
+            continue
+        prices = money_values(text)
+        if not prices:
+            continue
+        if not any(k in text.lower() for k in ["leilão", "leilao", "praça", "praça"]):
+            continue
+        # Prefer an explicit heading in the local block.
+        title = ""
+        for h in node.find_all(["h1", "h2", "h3", "h4"], limit=3):
+            t = clean(h.get_text(" ", strip=True))
+            if t:
+                title = t
+                break
+        if not title:
+            title = clean(text[:300])
+        href = url
+        a = node.find("a", href=True) if hasattr(node, "find") else None
+        if a:
+            href = urljoin(url, a.get("href"))
+        key = (city, source, href, dates[0][1], round(prices[0], 2))
         if key in seen:
             continue
         seen.add(key)
         out.append({
             "city": city,
             "title": title[:500],
-            "address": extract_address(block),
-            "price": price,
+            "address": extract_address(text),
+            "price": prices[0],
             "appraisal": prices[1] if len(prices) > 1 else None,
             "auction_date": dates[0][1],
-            "modality": modality_from(block),
+            "modality": modality_from(text),
             "source": source,
-            "source_url": href or url,
+            "source_url": href,
         })
-
-    # Second pass: headings for sources whose property title is not itself a link.
-    for node in soup.find_all(["h2", "h3", "h4"]):
-        title = clean(node.get_text(" ", strip=True))
-        if not is_property_title(title):
-            continue
-        node2 = node
-        block = ""
-        for _ in range(6):
-            node2 = getattr(node2, "parent", None)
-            if not node2:
-                break
-            txt = clean(node2.get_text(" ", strip=True))
-            if "R$" in txt and DATE_RE.search(txt):
-                block = txt
-                if len(txt) <= 1800:
-                    break
-        dates = future_dates(block)
-        prices = money_values(block)
-        if not block or not dates or not prices:
-            continue
-        link = node.find("a", href=True) or (node2.find("a", href=True) if node2 else None)
-        href = urljoin(url, link["href"]) if link else url
-        key = (city, source, href, dates[0][1])
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append({
-            "city": city, "title": title[:500], "address": extract_address(block),
-            "price": prices[0], "appraisal": prices[1] if len(prices) > 1 else None,
-            "auction_date": dates[0][1], "modality": modality_from(block),
-            "source": source, "source_url": href,
-        })
-
     return out
 
 
@@ -239,31 +272,38 @@ def uid(item):
 
 def refresh():
     all_items, errors = [], []
+    successful = set()
     for source, cities in SOURCES.items():
         for city, url in cities.items():
             try:
-                all_items.extend(scrape_source(source, city, url))
+                items = scrape_source(source, city, url)
+                if items:
+                    all_items.extend(items)
+                    successful.add((source, city))
+                else:
+                    errors.append(f"{source}/{city}: coleta retornou 0 ativos")
             except Exception as e:
                 errors.append(f"{source}/{city}: {e}")
 
     now = datetime.utcnow()
     db = SessionLocal()
-    # Remove old records from this source on each successful source scrape.
-    # This prevents expired listings from remaining forever in SQLite.
-    for source, cities in SOURCES.items():
-        for city in cities:
-            try:
-                if not any(e.startswith(f"{source}/{city}:") for e in errors):
-                    db.query(Listing).filter(Listing.source == source, Listing.city == city).delete()
-            except Exception:
-                pass
+    # Only replace a source/city snapshot after a successful non-empty scrape.
+    # This prevents a temporary Cloudflare/network failure from erasing good data.
+    for source, city in successful:
+        db.query(Listing).filter(Listing.source == source, Listing.city == city).delete()
     db.commit()
 
+    # Avoid exact duplicates from repeated cards/pages in the same source.
+    seen_uids = set()
     for x in all_items:
-        db.add(Listing(uid=uid(x), first_seen=now, last_seen=now, **x))
+        u = uid(x)
+        if u in seen_uids:
+            continue
+        seen_uids.add(u)
+        db.add(Listing(uid=u, first_seen=now, last_seen=now, **x))
     db.commit()
     db.close()
-    return len(all_items), len(all_items), errors
+    return len(seen_uids), len(seen_uids), errors
 
 
 def snapshot_rows(city=None):
@@ -302,7 +342,6 @@ def dashboard(city: str = "Todas as cidades", source: str = "Todos"):
     if source != "Todos":
         rows = [r for r in rows if r.source == source]
 
-    # Cross-source matching: same city + normalized address/title.
     green_keys = set()
     for r in rows:
         if r.source == "Leilão Imóvel":
@@ -338,6 +377,7 @@ def dashboard(city: str = "Todas as cidades", source: str = "Todos"):
     a{{color:#2563eb}}
     select,button{{padding:12px;border-radius:10px;border:1px solid #ccd3dd}}
     button{{background:#111827;color:white}}
+    .error{{background:#fff7ed;border:1px solid #fed7aa;padding:12px;border-radius:12px}}
     @media(max-width:650px){{.stats{{grid-template-columns:1fr}}}}
     </style></head><body>
     <header><h1>🔎 Radar de Leilões</h1><div>Guarapari + Vitória · judicial · extrajudicial</div></header>
